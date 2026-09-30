@@ -2,6 +2,8 @@
 
 Flash-sale inventory reservation service: atomic reserve / confirm / stock endpoints with automatic 5-minute expiry, graceful shutdown, and race-tested concurrency.
 
+Live: **https://indico_engine.dwika.tech**
+
 ## Run
 
 ```bash
@@ -39,24 +41,24 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for design decisions.
 
 ```bash
 # 1. Cek stok — total/reserved/available
-curl "http://localhost:8085/api/v1/inventory/stock?item_id=item_4021"
+curl "https://indico_engine.dwika.tech/api/v1/inventory/stock?item_id=item_4021"
 # {"item_id":"item_4021","total_stock":100,"reserved_stock":0,"available_stock":100}
 
 # 2. Reservasi 2 unit untuk seorang user
-curl -X POST http://localhost:8085/api/v1/inventory/reserve \
+curl -X POST https://indico_engine.dwika.tech/api/v1/inventory/reserve \
   -H 'Content-Type: application/json' \
   -d '{"user_id":"usr_9981","item_id":"item_4021","quantity":2}'
 # {"status":"success","reservation_id":"res_883291","item_id":"item_4021",
 #  "quantity":2,"expires_at":"2026-09-30T16:35:00Z"}
 
 # 3. Konfirmasi sebelum 5 menit — stok permanen berkurang
-curl -X POST http://localhost:8085/api/v1/inventory/confirm \
+curl -X POST https://indico_engine.dwika.tech/api/v1/inventory/confirm \
   -H 'Content-Type: application/json' \
   -d '{"reservation_id":"res_883291"}'
 # {"status":"success","reservation_id":"res_883291","confirmed_at":"2026-09-30T16:32:00Z"}
 
 # 4. (Opsional) Cek stok lagi — total_stock turun 2, reserved kembali 0
-curl "http://localhost:8085/api/v1/inventory/stock?item_id=item_4021"
+curl "https://indico_engine.dwika.tech/api/v1/inventory/stock?item_id=item_4021"
 ```
 
 Tidak dikonfirmasi dalam 5 menit → reservasi otomatis kedaluwarsa (reaper 10 detik + lazy expiry saat disentuh), stok dikembalikan, dan confirm berikutnya ditolak `RESERVATION_EXPIRED` (410).
