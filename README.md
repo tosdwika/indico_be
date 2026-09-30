@@ -1,66 +1,77 @@
 # indico_be — Inventory Reservation API (Go)
 
-Flash-sale inventory reservation service: atomic reserve / confirm / stock endpoints with automatic 5-minute expiry, graceful shutdown, and race-tested concurrency.
+Layanan reservasi stok untuk flash-sale: ribuan user merebut barang yang sama tanpa oversell, dengan reservasi otomatis kedaluwarsa dalam 5 menit.
 
 Live: **https://indico_engine.dwika.tech**
 
-## Run
+## Cara Kerja (singkat)
+
+1. **Reserve** — user memesan N unit. Sistem mengunci stok untuknya selama **5 menit**.
+2. **Confirm** — user membayar sebelum habis waktu → stok benar-benar berkurang. Konfirmasi ganda ditolak.
+3. **Tidak konfirmasi** → stok otomatis dikembalikan setelah 5 menit, dan orang lain bisa memesan lagi.
+
+Kuncinya semua di satu tempat: setiap operasi stok berjalan di dalam *lock per-item*, jadi cek-stok dan pengurangan-stok tidak bisa disisipi proses lain — oversell mustahil secara konstruksi. Detail desain: [ARCHITECTURE.md](ARCHITECTURE.md).
+
+## Menjalankan
 
 ```bash
-go run ./cmd/server          # listens on :8085
+go run ./cmd/server          # jalan di :8085
 ```
 
-Optional seed: `SEED_ITEMS="item_4021:100,item_9001:50" go run ./cmd/server` (default: `item_4021:100`).
+Ganti data awal (opsional): `SEED_ITEMS="item_4021:100,item_9001:50" go run ./cmd/server` — default `item_4021:100`.
 
-## Test
+## Tes
 
 ```bash
 go test -race -v ./...
 ```
 
+Termasuk stress test: ratusan reserve bersamaan tidak boleh melebihi stok, dan konfirmasi paralel hanya boleh sukses satu kali.
+
 ## Docker
 
 ```bash
-docker build -t indico_be .
-docker run -p 8085:8085 indico_be
+docker build -t indico_engine .
+docker run -p 8085:8085 indico_engine
 ```
 
-## Endpoints
+## API
 
-| Method | Path | Description |
+| Method | Endpoint | Fungsi |
 |---|---|---|
-| POST | `/api/v1/inventory/reserve` | Reserve stock. Body: `{"user_id","item_id","quantity"}`. Returns reservation + `expires_at` (5 min TTL). |
-| POST | `/api/v1/inventory/confirm` | Commit a reservation. Body: `{"reservation_id"}`. |
-| GET | `/api/v1/inventory/stock?item_id=...` | Real-time stock breakdown. |
+| `POST` | `/api/v1/inventory/reserve` | Pesan stok — body `{"user_id","item_id","quantity"}` |
+| `POST` | `/api/v1/inventory/confirm` | Konfirmasi pesanan — body `{"reservation_id"}` |
+| `GET` | `/api/v1/inventory/stock?item_id=…` | Lihat stok saat ini |
 
-Errors: `{"error":{"code":"...","message":"..."}}` — codes `INVALID_INPUT`, `ITEM_NOT_FOUND`, `INSUFFICIENT_STOCK` (409), `RESERVATION_NOT_FOUND` (404), `RESERVATION_EXPIRED` (410), `ALREADY_CONFIRMED` (409).
+Error selalu berbentuk `{"error":{"code","message"}}`:
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for design decisions.
+| Kode | Arti |
+|---|---|
+| `INVALID_INPUT` (400) | field kosong / quantity < 1 |
+| `ITEM_NOT_FOUND` (404) | item tidak ada |
+| `INSUFFICIENT_STOCK` (409) | stok kurang |
+| `RESERVATION_NOT_FOUND` (404) | ID reservasi tidak dikenal |
+| `RESERVATION_EXPIRED` (410) | kehabisan waktu 5 menit, stok sudah balik |
+| `ALREADY_CONFIRMED` (409) | sudah dikonfirmasi sebelumnya |
 
-## Penggunaan (curl walkthrough)
+## Contoh Pakai
 
 ```bash
-# 1. Cek stok — total/reserved/available
+# 1. Lihat stok
 curl "https://indico_engine.dwika.tech/api/v1/inventory/stock?item_id=item_4021"
-# {"item_id":"item_4021","total_stock":100,"reserved_stock":0,"available_stock":100}
+# → {"total_stock":100,"reserved_stock":0,"available_stock":100}
 
-# 2. Reservasi 2 unit untuk seorang user
+# 2. Pesan 2 unit (simpan reservation_id dari response)
 curl -X POST https://indico_engine.dwika.tech/api/v1/inventory/reserve \
   -H 'Content-Type: application/json' \
   -d '{"user_id":"usr_9981","item_id":"item_4021","quantity":2}'
-# {"status":"success","reservation_id":"res_883291","item_id":"item_4021",
-#  "quantity":2,"expires_at":"2026-09-30T16:35:00Z"}
+# → {"status":"success","reservation_id":"res_883291","expires_at":...}
 
-# 3. Konfirmasi sebelum 5 menit — stok permanen berkurang
+# 3. Konfirmasi sebelum 5 menit
 curl -X POST https://indico_engine.dwika.tech/api/v1/inventory/confirm \
   -H 'Content-Type: application/json' \
   -d '{"reservation_id":"res_883291"}'
-# {"status":"success","reservation_id":"res_883291","confirmed_at":"2026-09-30T16:32:00Z"}
-
-# 4. (Opsional) Cek stok lagi — total_stock turun 2, reserved kembali 0
-curl "https://indico_engine.dwika.tech/api/v1/inventory/stock?item_id=item_4021"
+# → {"status":"success","confirmed_at":...}
 ```
 
-Tidak dikonfirmasi dalam 5 menit → reservasi otomatis kedaluwarsa (reaper 10 detik + lazy expiry saat disentuh), stok dikembalikan, dan confirm berikutnya ditolak `RESERVATION_EXPIRED` (410).
-
-Frontend dashboard: lihat [indico_fe](../indico_fe).
+Frontend-nya ada di [indico_fe](../indico_fe).
