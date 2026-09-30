@@ -1,32 +1,108 @@
-# Architecture — High-Throughput Inventory Reservation System
+# Arsitektur Sistem Reservasi Stok
 
-## 1. Architectural Design & Synchronization
+Dokumen ini menjelaskan cara sistem menjaga stok tetap akurat saat banyak pengguna melakukan reservasi secara bersamaan, keterbatasan arsitektur saat ini, dan perubahan yang diperlukan jika aplikasi dijalankan pada banyak server.
 
-**State:** single-process, in-memory, sharded by item. Two lock layers:
-- A global `sync.Mutex` guards only the map structures (insert/lookup of stocks, reservations, per-item locks).
-- A per-item `sync.Mutex` guards all stock mutations and reservation status transitions for that item.
+## 1. Desain Arsitektur dan Pengelolaan Akses Bersamaan
 
-The critical section (`CreateReservation`: check `available >= qty` → increment `reserved`) runs entirely under the per-item lock, so the check-and-hold is atomic — oversell is impossible by construction, not by retry. Confirm/double-confirm races are handled the same way: status transition + stock decrement happen atomically under the item lock, so 50 concurrent confirms yield exactly one success (see `TestStressConcurrentConfirmIdempotencyency`).
+### Penyimpanan data
 
-**Expiry:** two-tiered. A background reaper sweeps every 10s and releases expired reservations; `Confirm` also performs lazy expiry — an expired reservation is released on touch, then rejected. Stock therefore never leaks as long as either path runs.
+Data stok dan reservasi saat ini disimpan di memori aplikasi. Pendekatan ini dipilih karena sederhana, cepat, dan cukup untuk ruang lingkup tugas ini. Konsekuensinya, seluruh data akan hilang ketika aplikasi dihentikan atau dimulai ulang.
 
-**Error/response format:** a single envelope `{"error": {"code": "...", "message": "..."}}` with machine-readable codes (`INSUFFICIENT_STOCK`, `RESERVATION_EXPIRED`, ...) mapped to correct HTTP statuses (409, 410, 404, 400). Clients branch on `code`, humans read `message`.
+Repository menggunakan dua jenis lock:
 
-## 2. Distributed Scaling & Failure Modes
+1. **Lock global (`sync.Mutex`)** hanya digunakan untuk mengakses map yang menyimpan stok, reservasi, dan daftar lock per item.
+2. **Lock per item** digunakan ketika stok atau status reservasi untuk item tersebut berubah.
 
-**What breaks at 10 instances:** everything, because state is per-process memory. Each instance has its own stock map, so reservations confirm on a different node fail as `RESERVATION_NOT_FOUND`, and available-stock checks diverge — ten instances each believe they own all 100 units and oversell 10×.
+Lock per item memungkinkan transaksi untuk barang yang berbeda diproses secara bersamaan. Sebagai contoh, reservasi untuk `item_4021` tidak perlu menunggu reservasi untuk `item_9001` selesai.
 
-**Stateless redesign:** move the stock row to Postgres and make the hot path a single atomic statement:
+### Pencegahan overselling
 
-```sql
-UPDATE stocks SET reserved = reserved + $qty
-WHERE item_id = $1 AND total - reserved >= $qty;
+Proses reservasi melakukan dua langkah penting dalam satu bagian yang dilindungi lock:
+
+1. memeriksa apakah stok tersedia mencukupi; dan
+2. menambahkan jumlah yang dipesan ke stok yang sedang direservasi.
+
+Karena kedua langkah dilakukan tanpa melepas lock, proses lain tidak dapat mengubah stok di antara tahap pemeriksaan dan reservasi. Jika dua pengguna mencoba mengambil unit terakhir pada saat yang sama, hanya satu permintaan yang akan berhasil.
+
+Konfirmasi reservasi menggunakan prinsip yang sama. Pemeriksaan status, pengurangan stok, dan perubahan status menjadi `confirmed` dilakukan dalam satu lock. Dengan demikian, reservasi yang sama tidak dapat dikonfirmasi dua kali meskipun beberapa request datang bersamaan.
+
+Perilaku ini diuji melalui `TestStressNoOversell` dan `TestStressConcurrentConfirmIdempotency` dengan menjalankan banyak operasi secara paralel menggunakan race detector Go.
+
+### Reservasi kedaluwarsa
+
+Setiap reservasi aktif berlaku selama 5 menit. Sistem mengembalikan stok dari reservasi yang kedaluwarsa melalui dua jalur:
+
+- proses latar belakang memeriksa seluruh reservasi setiap 10 detik; dan
+- endpoint konfirmasi kembali memeriksa waktu kedaluwarsa sebelum memproses transaksi.
+
+Pemeriksaan kedua diperlukan agar reservasi yang baru saja kedaluwarsa tetap ditolak dengan benar, meskipun proses latar belakang belum menjalankan pemeriksaan berikutnya. Pengembalian stok dibuat idempotent, sehingga stok tidak akan bertambah dua kali jika kedua jalur memproses reservasi yang sama.
+
+### Format respons dan error
+
+Respons error menggunakan format yang konsisten:
+
+```json
+{
+  "error": {
+    "code": "INSUFFICIENT_STOCK",
+    "message": "not enough available stock"
+  }
+}
 ```
 
-Zero rows affected → insufficient stock. Reservation confirm uses the same pattern guarded by a status transition (`WHERE reservation_id = $id AND status = 'active' AND expires_at > now()`). The reaper becomes a single leader-elected job (or a `WHERE expires_at < now()` UPDATE run by any node — idempotent). The per-item mutex maps cleanly to row-level locks; hot items are naturally serialized by the database, and the app tier becomes stateless and horizontally scalable.
+`code` digunakan oleh frontend untuk membedakan jenis error, sedangkan `message` dapat langsung ditampilkan kepada pengguna. Setiap kondisi dipetakan ke status HTTP yang sesuai, misalnya:
 
-## 3. Engineering Trade-offs & AI Transparency
+- `400` untuk input yang tidak valid;
+- `404` untuk item atau reservasi yang tidak ditemukan;
+- `409` untuk stok tidak cukup atau reservasi yang sudah dikonfirmasi; dan
+- `410` untuk reservasi yang sudah kedaluwarsa.
 
-**Trade-offs in the 4–8h window:** in-memory store (no persistence — restart loses state) bought atomicity and zero infra for the concurrency-critical path. A TTL reaper (O(n) sweep every 10s) instead of an expiry heap: simple, and at flash-sale reservation volumes the map stays small enough that a scan is microseconds. Frontend uses 3s polling instead of WebSockets: one `setInterval`, no server changes, and live-enough for a mini dashboard.
+## 2. Skalabilitas dan Risiko Kegagalan
 
-**AI scenario where a suggestion was flawed:** an AI assistant proposed using a single `sync.RWMutex` around the whole inventory map "for simplicity." Under flash-sale load this serializes *all* items behind one lock — item A's buyers block item B's — turning the service into a concurrency of 1. The flaw was invisible in toy tests (single item, low contention) and only appears under multi-item stress. The fix was the per-item sharded lock design described above, validated by `go test -race` stress tests.
+### Batasan arsitektur saat ini
+
+Arsitektur in-memory ini aman selama hanya ada satu instance aplikasi. Jika aplikasi langsung dijalankan pada 10 instance, setiap instance akan memiliki salinan stok dan reservasinya sendiri.
+
+Dampaknya:
+
+- setiap instance dapat menganggap stok yang sama masih tersedia;
+- total penjualan dapat melebihi stok sebenarnya;
+- reservasi yang dibuat di satu instance tidak ditemukan ketika request konfirmasi masuk ke instance lain; dan
+- data hilang ketika container dimulai ulang.
+
+Karena itu, menambahkan load balancer dan memperbanyak instance tanpa memindahkan state bukanlah solusi yang aman.
+
+### Desain untuk banyak instance
+
+Untuk deployment terdistribusi, data stok dan reservasi perlu dipindahkan ke penyimpanan bersama seperti PostgreSQL. Pemeriksaan dan penambahan stok reservasi dapat dilakukan dengan satu query atomik:
+
+```sql
+UPDATE stocks
+SET reserved = reserved + $2
+WHERE item_id = $1
+  AND total - reserved >= $2;
+```
+
+Jika tidak ada baris yang berubah, berarti stok tidak mencukupi. Pendekatan ini membuat database menjadi sumber data utama dan mencegah beberapa instance menjual stok yang sama.
+
+Konfirmasi juga harus menggunakan perubahan status bersyarat, misalnya hanya memperbarui reservasi yang masih `active` dan belum melewati `expires_at`. Transaksi database atau row-level lock digunakan agar perubahan status reservasi dan pengurangan stok terjadi sebagai satu kesatuan.
+
+Pembersihan reservasi kedaluwarsa dapat dilakukan dengan query yang idempotent. Beberapa worker boleh menjalankannya bersamaan selama query hanya memperbarui reservasi yang masih aktif. Dengan desain tersebut, backend menjadi stateless dan dapat ditambah jumlah instancenya secara horizontal.
+
+## 3. Pertimbangan Teknis dan Transparansi Penggunaan AI
+
+### Keputusan dalam batas waktu pengerjaan
+
+Beberapa keputusan dibuat agar solusi tetap dapat diselesaikan dan diuji dengan baik dalam waktu yang tersedia:
+
+- **Penyimpanan in-memory** dipilih untuk menghindari kebutuhan infrastruktur database dan menjaga fokus pada kebenaran proses konkurensi. Kekurangannya, data tidak persisten dan aplikasi hanya aman untuk satu instance.
+- **Pemeriksaan berkala setiap 10 detik** dipilih daripada struktur data khusus berdasarkan waktu kedaluwarsa. Implementasinya lebih sederhana, tetapi membutuhkan pemindaian seluruh reservasi. Jika jumlah reservasi menjadi sangat besar, pendekatan ini sebaiknya diganti dengan indeks berdasarkan waktu kedaluwarsa atau antrean terjadwal.
+- **Polling frontend setiap 3 detik** dipilih daripada WebSocket. Untuk dashboard kecil, polling lebih mudah dioperasikan dan sudah cukup cepat. WebSocket baru diperlukan jika jumlah pengguna atau kebutuhan pembaruan real-time meningkat secara signifikan.
+
+### Penggunaan AI dan evaluasi hasilnya
+
+AI digunakan sebagai alat bantu selama pengembangan, tetapi setiap saran tetap diperiksa terhadap kebutuhan sistem dan diuji sebelum digunakan.
+
+Salah satu saran awal adalah menggunakan satu `sync.RWMutex` untuk seluruh data inventory karena implementasinya lebih sederhana. Pendekatan tersebut memang aman dari data race, tetapi membuat semua item memakai antrean lock yang sama. Reservasi pada satu item akan menghambat reservasi pada item lain, sehingga throughput menurun saat trafik meningkat.
+
+Saran tersebut tidak digunakan. Implementasi akhirnya memakai lock terpisah untuk setiap item, sementara lock global hanya menjaga struktur map. Hasilnya, perubahan pada item yang sama tetap aman dan berurutan, tetapi item yang berbeda masih dapat diproses secara paralel. Keputusan ini divalidasi menggunakan unit test, stress test, dan `go test -race -v ./...`.
