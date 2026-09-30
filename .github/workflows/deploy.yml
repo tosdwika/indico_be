@@ -1,0 +1,50 @@
+name: Build and Deploy Indico Engine
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Test
+        run: go test -race -v ./...
+
+      - name: Build Docker Image
+        run: |
+          docker build -t indico_engine:latest .
+          docker save indico_engine:latest | gzip > indico_engine.tar.gz
+
+      - name: Copy image to VPS
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          port: ${{ secrets.SSH_PORT }}
+          username: ${{ secrets.SSH_USERNAME }}
+          password: ${{ secrets.SSH_PASSWORD }}
+          source: "indico_engine.tar.gz"
+          target: "/tmp/"
+
+      - name: Deploy container on VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          port: ${{ secrets.SSH_PORT }}
+          username: ${{ secrets.SSH_USERNAME }}
+          password: ${{ secrets.SSH_PASSWORD }}
+          script: |
+            docker load -i /tmp/indico_engine.tar.gz
+            rm -f /tmp/indico_engine.tar.gz
+            docker stop indico_engine 2>/dev/null || true
+            docker rm indico_engine 2>/dev/null || true
+            docker run -d --name indico_engine --restart unless-stopped -p 127.0.0.1:8085:8085 indico_engine:latest
+            curl -sf http://127.0.0.1:8085/api/v1/inventory/stock?item_id=item_4021 > /dev/null
