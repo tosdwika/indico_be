@@ -1,172 +1,227 @@
 package repositories
 
 import (
+	"database/sql"
+	"errors"
 	"indico_be/app/models"
-	"sync"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
-// In-memory store with a per-item mutex-sharded map.
-// NOTE: single-instance state; in distributed mode, replace with Postgres
-// and use SELECT ... FOR UPDATE (or conditional UPDATE) for the hot path.
 type InventoryRepository struct {
-	mu    sync.Mutex // guards stocks/reservations maps themselves
-	locks map[string]*sync.Mutex
-
-	stocks       map[string]*models.Stock
-	reservations map[string]*models.Reservation
+	db *sql.DB
 }
 
-func NewInventoryRepository() *InventoryRepository {
-	return &InventoryRepository{
-		locks:        make(map[string]*sync.Mutex),
-		stocks:       make(map[string]*models.Stock),
-		reservations: make(map[string]*models.Reservation),
+func NewInventoryRepository(path string) (*InventoryRepository, error) {
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return nil, err
 	}
-}
-
-func (r *InventoryRepository) lockItem(itemID string) *sync.Mutex {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	l, ok := r.locks[itemID]
-	if !ok {
-		l = &sync.Mutex{}
-		r.locks[itemID] = l
+	db.SetMaxOpenConns(1)
+	for _, statement := range []string{
+		`PRAGMA busy_timeout = 5000`,
+		`PRAGMA journal_mode = WAL`,
+		`PRAGMA foreign_keys = ON`,
+		`CREATE TABLE IF NOT EXISTS stocks (
+			item_id TEXT PRIMARY KEY,
+			total_stock INTEGER NOT NULL CHECK (total_stock >= 0),
+			reserved_qty INTEGER NOT NULL DEFAULT 0 CHECK (reserved_qty >= 0 AND reserved_qty <= total_stock)
+		)`,
+		`CREATE TABLE IF NOT EXISTS reservations (
+			id TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL,
+			item_id TEXT NOT NULL REFERENCES stocks(item_id),
+			quantity INTEGER NOT NULL CHECK (quantity > 0),
+			expires_at TEXT NOT NULL,
+			status TEXT NOT NULL CHECK (status IN ('active', 'confirmed', 'expired')),
+			created_at TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS reservations_expiry_idx ON reservations(status, expires_at)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			db.Close()
+			return nil, err
+		}
 	}
-	return l
+	return &InventoryRepository{db: db}, nil
 }
 
-// mapOf guards raw map access (r.mu); the pointed-to values are mutated under the item lock.
-func (r *InventoryRepository) stockOf(itemID string) *models.Stock {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.stocks[itemID]
+func (r *InventoryRepository) Close() error { return r.db.Close() }
+
+// Seed menambahkan stok awal jika item tersebut belum tersimpan.
+func (r *InventoryRepository) Seed(itemID string, total int) error {
+	_, err := r.db.Exec(`INSERT OR IGNORE INTO stocks(item_id, total_stock) VALUES (?, ?)`, itemID, total)
+	return err
 }
 
-func (r *InventoryRepository) putReservation(res *models.Reservation) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.reservations[res.ID] = res
-}
+func (r *InventoryRepository) ResetStock(itemID string, total int) error {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 
-// Seed adds an item with the given total stock (idempotent reset).
-func (r *InventoryRepository) Seed(itemID string, total int) {
-	l := r.lockItem(itemID)
-	l.Lock()
-	defer l.Unlock()
-	r.mu.Lock()
-	r.stocks[itemID] = &models.Stock{ItemID: itemID, TotalStock: total}
-	r.mu.Unlock()
+	result, err := tx.Exec(`UPDATE stocks SET total_stock = ?, reserved_qty = 0 WHERE item_id = ?`, total, itemID)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed == 0 {
+		return ErrItemNotFound
+	}
+	if _, err := tx.Exec(`UPDATE reservations SET status = 'expired' WHERE item_id = ? AND status = 'active'`, itemID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (r *InventoryRepository) GetStock(itemID string) (*models.Stock, bool) {
-	l := r.lockItem(itemID)
-	l.Lock()
-	defer l.Unlock()
-	s := r.stockOf(itemID)
-	if s == nil {
-		return nil, false
-	}
-	cp := *s
-	return &cp, true
+	s := &models.Stock{}
+	err := r.db.QueryRow(`SELECT item_id, total_stock, reserved_qty FROM stocks WHERE item_id = ?`, itemID).
+		Scan(&s.ItemID, &s.TotalStock, &s.ReservedQty)
+	return s, err == nil
 }
 
-// CreateReservation atomically reserves qty if available. Returns the reservation or error.
 func (r *InventoryRepository) CreateReservation(res *models.Reservation) error {
-	l := r.lockItem(res.ItemID)
-	l.Lock()
-	defer l.Unlock()
-
-	s := r.stockOf(res.ItemID)
-	if s == nil {
-		return ErrItemNotFound
+	tx, err := r.db.Begin()
+	if err != nil {
+		return err
 	}
-	if s.Available() < res.Quantity {
+	defer tx.Rollback()
+
+	result, err := tx.Exec(`UPDATE stocks SET reserved_qty = reserved_qty + ?
+		WHERE item_id = ? AND total_stock - reserved_qty >= ?`, res.Quantity, res.ItemID, res.Quantity)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed == 0 {
+		var exists int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM stocks WHERE item_id = ?`, res.ItemID).Scan(&exists); err != nil {
+			return err
+		}
+		if exists == 0 {
+			return ErrItemNotFound
+		}
 		return ErrInsufficientStock
 	}
-	s.ReservedQty += res.Quantity
-	r.putReservation(res)
-	return nil
+
+	_, err = tx.Exec(`INSERT INTO reservations(id, user_id, item_id, quantity, expires_at, status, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`, res.ID, res.UserID, res.ItemID, res.Quantity,
+		formatTime(res.ExpiresAt), res.Status, formatTime(res.CreatedAt))
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
-// GetReservation returns a copy taken under the item lock
-// (Status is mutated under the item lock in Confirm/Expire).
 func (r *InventoryRepository) GetReservation(id string) (*models.Reservation, bool) {
-	r.mu.Lock()
-	res, ok := r.reservations[id]
-	r.mu.Unlock()
-	if !ok {
-		return nil, false
-	}
-	l := r.lockItem(res.ItemID)
-	l.Lock()
-	defer l.Unlock()
-	cp := *res
-	return &cp, true
+	res, err := scanReservation(r.db.QueryRow(`SELECT id, user_id, item_id, quantity, expires_at, status, created_at
+		FROM reservations WHERE id = ?`, id))
+	return res, err == nil
 }
 
-// ConfirmReservation atomically confirms an active reservation and decrements physical stock.
 func (r *InventoryRepository) ConfirmReservation(id string, now time.Time) (*models.Reservation, error) {
-	r.mu.Lock()
-	res, ok := r.reservations[id]
-	r.mu.Unlock()
-	if !ok {
-		return nil, ErrReservationNotFound
+	tx, err := r.db.Begin()
+	if err != nil {
+		return nil, err
 	}
+	defer tx.Rollback()
 
-	l := r.lockItem(res.ItemID)
-	l.Lock()
-	defer l.Unlock()
-
-	if res.Status == "confirmed" {
-		return nil, ErrAlreadyConfirmed
-	}
-	if res.Status == "expired" {
-		return nil, ErrReservationNotFound
-	}
-	if now.After(res.ExpiresAt) {
+	res, err := scanReservation(tx.QueryRow(`UPDATE reservations SET status = 'confirmed'
+		WHERE id = ? AND status = 'active' AND expires_at >= ?
+		RETURNING id, user_id, item_id, quantity, expires_at, status, created_at`, id, formatTime(now)))
+	if errors.Is(err, sql.ErrNoRows) {
+		current, lookupErr := scanReservation(tx.QueryRow(`SELECT id, user_id, item_id, quantity, expires_at, status, created_at
+			FROM reservations WHERE id = ?`, id))
+		if errors.Is(lookupErr, sql.ErrNoRows) {
+			return nil, ErrReservationNotFound
+		}
+		if lookupErr != nil {
+			return nil, lookupErr
+		}
+		if current.Status == "expired" {
+			return nil, ErrReservationNotFound
+		}
+		if current.Status == "confirmed" {
+			return nil, ErrAlreadyConfirmed
+		}
 		return nil, ErrReservationExpired
 	}
+	if err != nil {
+		return nil, err
+	}
 
-	s := r.stockOf(res.ItemID)
-	s.TotalStock -= res.Quantity
-	s.ReservedQty -= res.Quantity
-	res.Status = "confirmed"
-	cp := *res
-	return &cp, nil
+	if _, err := tx.Exec(`UPDATE stocks SET total_stock = total_stock - ?, reserved_qty = reserved_qty - ?
+		WHERE item_id = ?`, res.Quantity, res.Quantity, res.ItemID); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return res, nil
 }
 
-// ExpireReservation releases an expired reservation's hold. Idempotent.
 func (r *InventoryRepository) ExpireReservation(id string) {
-	r.mu.Lock()
-	res, ok := r.reservations[id]
-	r.mu.Unlock()
-	if !ok {
+	tx, err := r.db.Begin()
+	if err != nil {
 		return
 	}
+	defer tx.Rollback()
 
-	l := r.lockItem(res.ItemID)
-	l.Lock()
-	defer l.Unlock()
-
-	if res.Status != "active" || res.ExpiresAt.After(time.Now()) {
+	res, err := scanReservation(tx.QueryRow(`UPDATE reservations SET status = 'expired'
+		WHERE id = ? AND status = 'active' AND expires_at <= ?
+		RETURNING id, user_id, item_id, quantity, expires_at, status, created_at`, id, formatTime(time.Now().UTC())))
+	if err != nil {
 		return
 	}
-	if s := r.stockOf(res.ItemID); s != nil {
-		s.ReservedQty -= res.Quantity
+	if _, err := tx.Exec(`UPDATE stocks SET reserved_qty = reserved_qty - ? WHERE item_id = ?`, res.Quantity, res.ItemID); err != nil {
+		return
 	}
-	res.Status = "expired"
+	_ = tx.Commit()
 }
 
-// ReservationIDs snapshots all reservation IDs for the cleanup sweep.
-// NOTE: O(n) scan per sweep; if the reservation count grows large, maintain
-// an expiry-ordered index (heap) instead.
 func (r *InventoryRepository) ReservationIDs() []string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	ids := make([]string, 0, len(r.reservations))
-	for id := range r.reservations {
-		ids = append(ids, id)
+	rows, err := r.db.Query(`SELECT id FROM reservations WHERE status = 'active' AND expires_at <= ?`, formatTime(time.Now().UTC()))
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if rows.Scan(&id) == nil {
+			ids = append(ids, id)
+		}
 	}
 	return ids
 }
+
+type rowScanner interface {
+	Scan(...any) error
+}
+
+func scanReservation(row rowScanner) (*models.Reservation, error) {
+	res := &models.Reservation{}
+	var expiresAt, createdAt string
+	if err := row.Scan(&res.ID, &res.UserID, &res.ItemID, &res.Quantity, &expiresAt, &res.Status, &createdAt); err != nil {
+		return nil, err
+	}
+	var err error
+	if res.ExpiresAt, err = time.Parse(time.RFC3339Nano, expiresAt); err != nil {
+		return nil, err
+	}
+	if res.CreatedAt, err = time.Parse(time.RFC3339Nano, createdAt); err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+func formatTime(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }

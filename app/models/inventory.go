@@ -3,9 +3,9 @@ package models
 import "time"
 
 type Stock struct {
-	ItemID       string
-	TotalStock   int
-	ReservedQty  int // sum of active (unexpired, unconfirmed) reservations
+	ItemID      string
+	TotalStock  int
+	ReservedQty int // sum of active (unexpired, unconfirmed) reservations
 }
 
 func (s Stock) Available() int { return s.TotalStock - s.ReservedQty }
@@ -28,6 +28,17 @@ type ReserveRequest struct {
 
 type ConfirmRequest struct {
 	ReservationID string `json:"reservation_id"`
+}
+
+type ResetRequest struct {
+	ItemID     string `json:"item_id"`
+	TotalStock int    `json:"total_stock"`
+}
+
+type ResetResponse struct {
+	Status     string `json:"status"`
+	ItemID     string `json:"item_id"`
+	TotalStock int    `json:"total_stock"`
 }
 
 type ReserveResponse struct {

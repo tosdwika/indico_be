@@ -1,19 +1,22 @@
 package controllers
 
 import (
+	"crypto/subtle"
 	"indico_be/app/models"
 	"net/http"
+	"strings"
 	"time"
 
 	"indico_be/app/services"
 )
 
 type InventoryController struct {
-	Svc *services.InventoryService
+	Svc        *services.InventoryService
+	ResetToken string
 }
 
-func NewInventoryController(svc *services.InventoryService) *InventoryController {
-	return &InventoryController{Svc: svc}
+func NewInventoryController(svc *services.InventoryService, resetToken string) *InventoryController {
+	return &InventoryController{Svc: svc, ResetToken: resetToken}
 }
 
 // POST /api/v1/inventory/reserve
@@ -83,6 +86,40 @@ func (c *InventoryController) Confirm(w http.ResponseWriter, r *http.Request) {
 		Status:        "success",
 		ReservationID: res.ID,
 		ConfirmedAt:   time.Now().UTC(),
+	})
+}
+
+// POST /api/v1/inventory/reset
+func (c *InventoryController) Reset(w http.ResponseWriter, r *http.Request) {
+	provided := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if c.ResetToken == "" || subtle.ConstantTimeCompare([]byte(provided), []byte(c.ResetToken)) != 1 {
+		writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "reset token is invalid")
+		return
+	}
+
+	var req models.ResetRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		return
+	}
+	if req.ItemID == "" || req.TotalStock < 1 {
+		writeError(w, http.StatusBadRequest, "INVALID_INPUT", "item_id is required and total_stock must be at least 1")
+		return
+	}
+
+	stock, err := c.Svc.Reset(req.ItemID, req.TotalStock)
+	if err != nil {
+		if err == services.ErrItemNotFound {
+			writeError(w, http.StatusNotFound, "ITEM_NOT_FOUND", "item does not exist")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "INTERNAL", "unexpected error")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, models.ResetResponse{
+		Status:     "success",
+		ItemID:     stock.ItemID,
+		TotalStock: stock.TotalStock,
 	})
 }
 

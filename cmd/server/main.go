@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -19,7 +20,20 @@ import (
 
 func main() {
 	// --- bootstrap ---
-	repo := repositories.NewInventoryRepository()
+	databasePath := os.Getenv("DATABASE_PATH")
+	if databasePath == "" {
+		databasePath = "data/indico.db"
+	}
+	if databasePath != ":memory:" {
+		if err := os.MkdirAll(filepath.Dir(databasePath), 0755); err != nil {
+			log.Fatalf("create database directory: %v", err)
+		}
+	}
+	repo, err := repositories.NewInventoryRepository(databasePath)
+	if err != nil {
+		log.Fatalf("open database: %v", err)
+	}
+	defer repo.Close()
 
 	// SEED_ITEM="item_4021:100,item_9001:50"
 	if seeds := os.Getenv("SEED_ITEMS"); seeds != "" {
@@ -31,15 +45,17 @@ func main() {
 				fmt.Sscanf(parts[1], "%d", &n)
 			}
 			if id != "" && n > 0 {
-				repo.Seed(id, n)
+				if err := repo.Seed(id, n); err != nil {
+					log.Fatalf("seed %s: %v", id, err)
+				}
 			}
 		}
-	} else {
-		repo.Seed("item_4021", 100)
+	} else if err := repo.Seed("item_4021", 100); err != nil {
+		log.Fatalf("seed item_4021: %v", err)
 	}
 
 	svc := services.NewInventoryService(repo)
-	ic := controllers.NewInventoryController(svc)
+	ic := controllers.NewInventoryController(svc, os.Getenv("RESET_TOKEN"))
 
 	mux := http.NewServeMux()
 	routes.Register(mux, ic)

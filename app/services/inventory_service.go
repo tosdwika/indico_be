@@ -12,7 +12,7 @@ import (
 const ReservationTTL = 5 * time.Minute
 
 var (
-	ErrItemNotFound         = repositories.ErrItemNotFound
+	ErrItemNotFound        = repositories.ErrItemNotFound
 	ErrInsufficientStock   = repositories.ErrInsufficientStock
 	ErrReservationNotFound = repositories.ErrReservationNotFound
 	ErrReservationExpired  = repositories.ErrReservationExpired
@@ -54,6 +54,14 @@ func (s *InventoryService) Confirm(id string) (*models.Reservation, error) {
 		return nil, ErrReservationExpired
 	}
 	return s.repo.ConfirmReservation(id, time.Now().UTC())
+}
+
+func (s *InventoryService) Reset(itemID string, total int) (*models.Stock, error) {
+	if err := s.repo.ResetStock(itemID, total); err != nil {
+		return nil, err
+	}
+	stock, _ := s.repo.GetStock(itemID)
+	return stock, nil
 }
 
 func (s *InventoryService) Stock(itemID string) (*models.Stock, error) {

@@ -9,5 +9,6 @@ import (
 func Register(mux *http.ServeMux, ic *controllers.InventoryController) {
 	mux.HandleFunc("POST /api/v1/inventory/reserve", ic.Reserve)
 	mux.HandleFunc("POST /api/v1/inventory/confirm", ic.Confirm)
+	mux.HandleFunc("POST /api/v1/inventory/reset", ic.Reset)
 	mux.HandleFunc("GET /api/v1/inventory/stock", ic.Stock)
 }
