@@ -7,7 +7,8 @@ import (
 )
 
 // In-memory store with a per-item mutex-sharded map.
-// ponytail: in-memory single-instance; swap for Postgres SELECT ... FOR UPDATE in distributed mode.
+// NOTE: single-instance state; in distributed mode, replace with Postgres
+// and use SELECT ... FOR UPDATE (or conditional UPDATE) for the hot path.
 type InventoryRepository struct {
 	mu    sync.Mutex // guards stocks/reservations maps themselves
 	locks map[string]*sync.Mutex
@@ -157,8 +158,9 @@ func (r *InventoryRepository) ExpireReservation(id string) {
 	res.Status = "expired"
 }
 
-// ReservationIDs snapshots all reservation IDs.
-// ponytail: O(n) scan per cleanup sweep; index by expiry heap if reservation count is huge.
+// ReservationIDs snapshots all reservation IDs for the cleanup sweep.
+// NOTE: O(n) scan per sweep; if the reservation count grows large, maintain
+// an expiry-ordered index (heap) instead.
 func (r *InventoryRepository) ReservationIDs() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
