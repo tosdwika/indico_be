@@ -81,7 +81,7 @@ Saat reservasi kedaluwarsa, status berubah menjadi `expired` dan `reserved_qty` 
 
 Reset dijalankan dalam satu transaksi. Backend mengubah stok item ke jumlah baru, mengosongkan `reserved_qty`, lalu mengubah seluruh reservasi aktif pada item tersebut menjadi `expired`.
 
-Halaman `https://indico.dwika.tech/reset` menggunakan endpoint `POST /api/v1/inventory/reset`. Endpoint mewajibkan bearer token yang dibandingkan dengan environment variable `RESET_TOKEN`. Reservasi lama tidak dapat dikonfirmasi lagi setelah reset dilakukan.
+Halaman `https://indico.dwika.tech/reset` menggunakan endpoint `POST /api/v1/inventory/reset`. Reservasi lama tidak dapat dikonfirmasi lagi setelah reset dilakukan.
 
 ## 5. Penyimpanan File SQLite
 

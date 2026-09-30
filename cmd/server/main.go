@@ -55,7 +55,7 @@ func main() {
 	}
 
 	svc := services.NewInventoryService(repo)
-	ic := controllers.NewInventoryController(svc, os.Getenv("RESET_TOKEN"))
+	ic := controllers.NewInventoryController(svc)
 
 	mux := http.NewServeMux()
 	routes.Register(mux, ic)

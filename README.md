@@ -69,7 +69,6 @@ docker volume create indico_data
 docker run --rm \
   -p 8085:8085 \
   -e DATABASE_PATH=/app/data/indico.db \
-  -e RESET_TOKEN=ganti-dengan-token-rahasia \
   -v indico_data:/app/data \
   --name indico_engine \
   indico_engine
@@ -150,7 +149,6 @@ Contoh respons:
 
 ```http
 POST /api/v1/inventory/reset
-Authorization: Bearer <RESET_TOKEN>
 Content-Type: application/json
 ```
 
@@ -161,9 +159,7 @@ Content-Type: application/json
 }
 ```
 
-Reset mengubah stok item ke jumlah baru, mengosongkan stok yang sedang direservasi, dan membatalkan seluruh reservasi aktif untuk item tersebut. Endpoint ini digunakan oleh halaman `https://indico.dwika.tech/reset` dan dilindungi token dari environment variable `RESET_TOKEN`.
-
-Untuk deployment melalui GitHub Actions, tambahkan `RESET_TOKEN` sebagai repository secret pada repo backend.
+Reset mengubah stok item ke jumlah baru, mengosongkan stok yang sedang direservasi, dan membatalkan seluruh reservasi aktif untuk item tersebut. Endpoint ini digunakan oleh halaman `https://indico.dwika.tech/reset`.
 
 ## Format Error
 

@@ -50,7 +50,6 @@ jobs:
             docker run -d --name indico_engine --restart unless-stopped \
               -p 127.0.0.1:8085:8085 \
               -e DATABASE_PATH=/app/data/indico.db \
-              -e RESET_TOKEN='${{ secrets.RESET_TOKEN }}' \
               -v /data/indico_engine:/app/data \
               indico_engine:latest
             for i in 1 2 3 4 5; do curl -sf "http://127.0.0.1:8085/api/v1/inventory/stock?item_id=item_4021" > /dev/null && exit 0; sleep 3; done; exit 1

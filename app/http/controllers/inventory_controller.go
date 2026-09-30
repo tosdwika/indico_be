@@ -1,22 +1,19 @@
 package controllers
 
 import (
-	"crypto/subtle"
 	"indico_be/app/models"
 	"net/http"
-	"strings"
 	"time"
 
 	"indico_be/app/services"
 )
 
 type InventoryController struct {
-	Svc        *services.InventoryService
-	ResetToken string
+	Svc *services.InventoryService
 }
 
-func NewInventoryController(svc *services.InventoryService, resetToken string) *InventoryController {
-	return &InventoryController{Svc: svc, ResetToken: resetToken}
+func NewInventoryController(svc *services.InventoryService) *InventoryController {
+	return &InventoryController{Svc: svc}
 }
 
 // POST /api/v1/inventory/reserve
@@ -91,12 +88,6 @@ func (c *InventoryController) Confirm(w http.ResponseWriter, r *http.Request) {
 
 // POST /api/v1/inventory/reset
 func (c *InventoryController) Reset(w http.ResponseWriter, r *http.Request) {
-	provided := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	if c.ResetToken == "" || subtle.ConstantTimeCompare([]byte(provided), []byte(c.ResetToken)) != 1 {
-		writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "reset token is invalid")
-		return
-	}
-
 	var req models.ResetRequest
 	if err := decodeJSON(w, r, &req); err != nil {
 		return
